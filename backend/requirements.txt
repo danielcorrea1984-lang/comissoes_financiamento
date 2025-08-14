@@ -1,2 +1,8 @@
-flask
-flask-cors
+Flask
+Flask-Cors
+Flask-JWT-Extended
+Flask-SQLAlchemy
+python-dotenv
+itsdangerous
+gunicorn
+psycopg2-binary
