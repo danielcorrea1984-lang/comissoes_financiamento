@@ -12,7 +12,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from sqlalchemy import text, func
 from dotenv import load_dotenv
 
-# Para tokens de redefinição de senha (mantido, pois você já usa /auth/forgot e /auth/reset)
+# Para tokens de redefinição de senha
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 load_dotenv()
@@ -26,6 +26,12 @@ app.config['SQLALCHEMY_DATABASE_URI'] = (
 )
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'dev-secret')
+
+# >>> FORÇA o schema 'public' no Postgres (útil no Render)
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "connect_args": {"options": "-csearch_path=public"}
+}
+# <<< FIM BLOCO >>>
 # ====================================
 
 db = SQLAlchemy(app)
@@ -35,6 +41,8 @@ JWTManager(app)
 # ===================== MODELOS =====================
 class Vendedor(db.Model):
     __tablename__ = 'vendedores'
+    # Se sua tabela estiver em outro schema, descomente:
+    # __table_args__ = {"schema": "public"}
     id = db.Column(db.Integer, primary_key=True)
     nome = db.Column(db.String(255), nullable=False)
     email = db.Column(db.String(255), unique=True, nullable=False)
@@ -163,7 +171,7 @@ def parse_month(s: str):
     except Exception:
         return None
 
-# ======== TOKEN DE RESET (para /auth/forgot e /auth/reset) ========
+# ======== TOKEN DE RESET ========
 def _pwd_reset_serializer():
     secret = app.config.get('JWT_SECRET_KEY', 'dev-secret')
     return URLSafeTimedSerializer(secret_key=secret, salt='pwd-reset')
@@ -197,8 +205,7 @@ def login():
         }
     })
 
-# ======== NOVOS ENDPOINTS usados pelo fluxo direto no front ========
-
+# ======== NOVOS ENDPOINTS ========
 @app.post('/auth/check-email')
 def check_email():
     """
@@ -236,15 +243,9 @@ def reset_password_direct():
     db.session.commit()
     return jsonify({'msg': 'Senha redefinida com sucesso'}), 200
 
-# ======== ESQUECI MINHA SENHA (atualizado para devolver token/url) ========
+# ======== ESQUECI MINHA SENHA ========
 @app.post('/auth/forgot')
 def forgot_password():
-    """
-    Recebe: { "email": "..." }
-    - 400 se e-mail vazio
-    - 404 se e-mail não cadastrado
-    - 200 com { token, url } se cadastrado
-    """
     data = request.get_json(silent=True) or {}
     email = (data.get('email') or '').strip().lower()
     if not email:
@@ -268,10 +269,6 @@ def forgot_password():
 
 @app.post('/auth/reset')
 def reset_password():
-    """
-    Recebe: { "token": "...", "nova_senha": "..." }
-    Valida o token (expira em 3600s = 1h), troca a senha do usuário.
-    """
     data = request.get_json(silent=True) or {}
     token = (data.get('token') or '').strip()
     nova = (data.get('nova_senha') or '').strip()
@@ -741,11 +738,75 @@ def stats_summary():
         'by_seller': by_seller
     })
 
-# ---------- Debug ----------
+# ---------- HEALTH & DEBUG ----------
+@app.get('/ping')
+def ping():
+    return jsonify(status="ok"), 200
+
+# Debug avançado (TEMPORÁRIO — remova depois que validar)
 @app.get('/_debug/db')
-def debug_db():
-    dbname = db.session.execute(text('SELECT current_database();')).scalar()
-    return jsonify({'current_database': dbname})
+def _debug_db():
+    try:
+        with db.engine.connect() as conn:
+            dbname = conn.execute(text("SELECT current_database()")).scalar()
+            schema = conn.execute(text("SELECT current_schema()")).scalar()
+            spath  = conn.execute(text("SHOW search_path")).scalar()
+            tables = conn.execute(text("""
+                SELECT table_schema || '.' || table_name
+                FROM information_schema.tables
+                WHERE table_type = 'BASE TABLE'
+                  AND table_schema NOT IN ('pg_catalog','information_schema')
+                ORDER BY 1
+            """)).fetchall()
+
+        return jsonify({
+            "DATABASE_URL_present": bool(os.environ.get("DATABASE_URL")),
+            "current_database": dbname,
+            "current_schema": schema,
+            "search_path": spath,
+            "first_tables": [t[0] for t in tables[:40]]
+        }), 200
+    except Exception as e:
+        app.logger.exception("debug_db failed")
+        return jsonify(error=str(e)), 500
+    
+
+    
+    # ===== Debug NOVO (rotas diferentes para garantir que subiu) =====
+APP_DEBUG_VERSION = "v2"
+
+@app.get("/_debug/version")
+def _debug_version():
+    # Útil para ver se seu deploy trouxe o código novo
+    return jsonify(version=APP_DEBUG_VERSION)
+
+@app.get("/_debug/db2")
+def _debug_db2():
+    try:
+        with db.engine.connect() as conn:
+            dbname = conn.execute(text("SELECT current_database()")).scalar()
+            schema = conn.execute(text("SELECT current_schema()")).scalar()
+            spath  = conn.execute(text("SHOW search_path")).scalar()
+            tables = conn.execute(text("""
+                SELECT table_schema || '.' || table_name
+                FROM information_schema.tables
+                WHERE table_type = 'BASE TABLE'
+                  AND table_schema NOT IN ('pg_catalog','information_schema')
+                ORDER BY 1
+            """)).fetchall()
+
+        return jsonify({
+            "DATABASE_URL_present": bool(os.environ.get("DATABASE_URL")),
+            "current_database": dbname,
+            "current_schema": schema,
+            "search_path": spath,
+            "first_tables": [t[0] for t in tables[:40]]
+        }), 200
+    except Exception as e:
+        app.logger.exception("debug_db2 failed")
+        return jsonify(error=str(e)), 500
+# ===== Fim Debug NOVO =====
+
 
 if __name__ == '__main__':
     app.run(debug=True)
