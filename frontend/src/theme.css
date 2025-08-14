@@ -1,0 +1,14 @@
+/* theme.css — reforços visuais */
+:root {
+  --brand-bg: #0b2a4a;
+  --brand-primary: #0f5fa5;
+  --brand-accent: #f2b705;
+  --brand-text: #ffffff;
+}
+
+.navbar { background: var(--brand-bg) !important; }
+.navbar .nav-link { color: #fff !important; }
+.navbar .nav-link.bg-primary { background: var(--brand-primary) !important; }
+
+.app-header { background: #fff; }
+.app-title { font-size: clamp(18px, 2.4vw, 22px); font-weight: 600; }

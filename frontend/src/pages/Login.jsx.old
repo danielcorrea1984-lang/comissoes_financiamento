@@ -1,0 +1,194 @@
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import api, { setToken, setUser } from '../api';
+
+export default function Login() {
+  const nav = useNavigate();
+
+  // --- estados do login ---
+  const [email, setEmail] = useState('');
+  const [senha, setSenha] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  // --- estados do "esqueci minha senha" ---
+  const [showForgot, setShowForgot] = useState(false);
+  const [forgotEmail, setForgotEmail] = useState('');
+  const [forgotLoading, setForgotLoading] = useState(false);
+  const [forgotMsg, setForgotMsg] = useState('');
+  const [forgotError, setForgotError] = useState('');
+
+  async function submit(e) {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const { data } = await api.post('/auth/login', { email, password: senha });
+      const token = data.access_token;
+      setToken(token);
+      setUser(data.user);
+
+      // === POPUP centralizado e maior ===
+      const largura = 1200;
+      const altura = 800;
+      const esquerda = Math.max(0, Math.round((window.screen.width - largura) / 2));
+      const topo = Math.max(0, Math.round((window.screen.height - altura) / 2));
+      const features = [
+        `width=${largura}`,
+        `height=${altura}`,
+        `left=${esquerda}`,
+        `top=${topo}`,
+        'menubar=no',
+        'toolbar=no',
+        'location=no',
+        'status=no',
+        'scrollbars=yes',
+        'resizable=yes'
+      ].join(',');
+
+      const win = window.open('/app', 'AJ7App', features);
+      if (!win) {
+        // Fallback caso o navegador bloqueie o popup
+        nav('/app');
+      }
+    } catch (err) {
+      setError(err?.response?.data?.msg || 'Falha no login');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function submitForgot(e) {
+    e.preventDefault();
+    setForgotError('');
+    setForgotMsg('');
+    setForgotLoading(true);
+    try {
+      // Endpoint esperado no backend (podemos criar em seguida)
+      await api.post('/auth/forgot', { email: forgotEmail });
+      setForgotMsg('Se o e-mail existir no sistema, enviaremos as instruções para redefinição de senha.');
+    } catch (err) {
+      // Mensagem genérica por segurança
+      setForgotMsg('Se o e-mail existir no sistema, enviaremos as instruções para redefinição de senha.');
+      // Caso queira exibir erro específico:
+      // setForgotError(err?.response?.data?.msg || 'Não foi possível solicitar a redefinição agora.');
+    } finally {
+      setForgotLoading(false);
+    }
+  }
+
+  return (
+    <div style={{ display: 'flex', height: '100vh' }}>
+      {/* Lado esquerdo - logo com fundo azul escuro */}
+      <div
+        style={{
+          flex: 1,
+          backgroundColor: '#002E5D', // azul escuro AJ7 Seguros
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        <img
+          src="/logo.png"
+          alt="Logo AJ7 Seguros"
+          style={{ maxWidth: '70%', height: 'auto' }}
+        />
+      </div>
+
+      {/* Lado direito - formulário */}
+      <div
+        style={{
+          flex: 1,
+          backgroundColor: '#fff',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '2rem',
+        }}
+      >
+        <div style={{ width: '100%', maxWidth: '350px' }}>
+          {!showForgot ? (
+            <>
+              <h3 className="mb-3 text-center">Entrar</h3>
+              <form onSubmit={submit}>
+                <input
+                  className="form-control mb-2"
+                  placeholder="E-mail"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  required
+                />
+                <input
+                  className="form-control mb-2"
+                  placeholder="Senha"
+                  type="password"
+                  value={senha}
+                  onChange={(e) => setSenha(e.target.value)}
+                  required
+                />
+                {error && <div className="alert alert-danger py-2">{error}</div>}
+
+                <div className="d-flex justify-content-between align-items-center mb-2">
+                  <button
+                    disabled={loading}
+                    className="btn btn-primary"
+                    type="submit"
+                  >
+                    {loading ? 'Entrando...' : 'Entrar'}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="btn btn-link p-0"
+                    onClick={() => {
+                      setShowForgot(true);
+                      setForgotEmail(email); // já aproveita o que digitou
+                      setForgotError('');
+                      setForgotMsg('');
+                    }}
+                  >
+                    Esqueci minha senha
+                  </button>
+                </div>
+              </form>
+            </>
+          ) : (
+            <>
+              <h4 className="mb-3 text-center">Redefinir senha</h4>
+              <form onSubmit={submitForgot}>
+                <input
+                  className="form-control mb-2"
+                  placeholder="Seu e-mail"
+                  type="email"
+                  value={forgotEmail}
+                  onChange={(e)=>setForgotEmail(e.target.value)}
+                  required
+                />
+                {forgotError && <div className="alert alert-danger py-2">{forgotError}</div>}
+                {forgotMsg && <div className="alert alert-info py-2">{forgotMsg}</div>}
+
+                <div className="d-flex justify-content-between align-items-center">
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary"
+                    onClick={() => setShowForgot(false)}
+                  >
+                    Voltar
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    disabled={forgotLoading}
+                    type="submit"
+                  >
+                    {forgotLoading ? 'Enviando...' : 'Enviar instruções'}
+                  </button>
+                </div>
+              </form>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
