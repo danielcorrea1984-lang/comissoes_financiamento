@@ -1,0 +1,47 @@
+import React from 'react';
+import { getUserInfo } from '../api';
+
+export default function DashboardHome(){
+  const user = getUserInfo();
+  const isAdmin = user?.role === 'admin';
+
+  return (
+    <div>
+      <div className="row g-3 mb-4">
+        <div className="col-md-4">
+          <div className="card shadow-sm">
+            <div className="card-body">
+              <h6 className="text-muted mb-2">Vendas do mês</h6>
+              <div className="display-6">—</div>
+              <small className="text-muted">Em breve: total de vendas {isAdmin ? 'geral' : 'do vendedor'}</small>
+            </div>
+          </div>
+        </div>
+        <div className="col-md-4">
+          <div className="card shadow-sm">
+            <div className="card-body">
+              <h6 className="text-muted mb-2">Comissões do mês</h6>
+              <div className="display-6">—</div>
+              <small className="text-muted">Em breve: comissões calculadas</small>
+            </div>
+          </div>
+        </div>
+        <div className="col-md-4">
+          <div className="card shadow-sm">
+            <div className="card-body">
+              <h6 className="text-muted mb-2">Status propostas</h6>
+              <div className="display-6">—</div>
+              <small className="text-muted">Em breve: distribuído por status</small>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="alert alert-info">
+        {isAdmin
+          ? 'Visão geral do administrador. Aqui vamos adicionar gráficos (vendas por período, bancos, lojas, metas).'
+          : 'Sua visão de vendedor. Aqui vamos mostrar suas vendas, comissões e metas.'}
+      </div>
+    </div>
+  );
+}
