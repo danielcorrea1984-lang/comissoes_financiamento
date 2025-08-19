@@ -1,3 +1,4 @@
+// frontend/src/sections/AdminCadastros.jsx
 import React, { useState } from 'react';
 import ManageBanks from './ManageBanks';
 import ManageStores from './ManageStores';
@@ -8,17 +9,32 @@ export default function AdminCadastros(){
 
   return (
     <div>
-      <h3 className="mb-3">Cadastro (Admin)</h3>
+      {/* Título removido a pedido */}
 
       <ul className="nav nav-tabs tabs-dark mb-3">
         <li className="nav-item">
-          <button className={`nav-link ${tab==='banks'?'active':''}`} onClick={()=>setTab('banks')}>Bancos</button>
+          <button
+            className={`nav-link ${tab==='banks'?'active':''}`}
+            onClick={()=>setTab('banks')}
+          >
+            Bancos
+          </button>
         </li>
         <li className="nav-item">
-          <button className={`nav-link ${tab==='stores'?'active':''}`} onClick={()=>setTab('stores')}>Lojas Parceiras</button>
+          <button
+            className={`nav-link ${tab==='stores'?'active':''}`}
+            onClick={()=>setTab('stores')}
+          >
+            Lojas Parceiras
+          </button>
         </li>
         <li className="nav-item">
-          <button className={`nav-link ${tab==='sellers'?'active':''}`} onClick={()=>setTab('sellers')}>Vendedores</button>
+          <button
+            className={`nav-link ${tab==='sellers'?'active':''}`}
+            onClick={()=>setTab('sellers')}
+          >
+            Vendedores
+          </button>
         </li>
       </ul>
 

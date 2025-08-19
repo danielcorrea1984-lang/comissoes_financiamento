@@ -87,6 +87,18 @@ export default function Dashboard(){
     }
   }
 
+  // limpar filtros (e recarregar)
+  function clearFilters(){
+    setStatus('');
+    setBancoId('');
+    setLojaId('');
+    setVendedorId('');
+    setStartDate(firstDayOfCurrentMonthISO());
+    setEndDate(todayISO());
+    // recarrega com filtros limpos
+    setTimeout(fetchStats, 0);
+  }
+
   useEffect(()=>{ loadFilters(); fetchStats(); /* eslint-disable-next-line */ },[]);
 
   // Totais
@@ -187,7 +199,7 @@ export default function Dashboard(){
       </div>
       <hr className="mt-0 mb-3" />
 
-      {/* Filtros (datas agrupadas para ADMIN e VENDEDOR) */}
+      {/* Filtros */}
       <div className="mb-3">
         <div className="row g-2">
           <div className="col-12 col-md-6 col-lg-3">
@@ -227,7 +239,7 @@ export default function Dashboard(){
             </select>
           </div>
 
-          {/* Período agrupado no mesmo bloco para ambos */}
+          {/* Período */}
           <div className="col-12 col-md-8 col-lg-6">
             <label className="form-label small mb-1">Período</label>
             <div className="d-flex align-items-center gap-2">
@@ -249,15 +261,32 @@ export default function Dashboard(){
             </div>
           </div>
 
+          {/* Botões: mesma proporção */}
           <div className="col-12 col-md-4 col-lg-3 d-flex align-items-end">
-            <button className="btn btn-primary btn-sm w-100" onClick={fetchStats} disabled={loading}>
-              {loading ? 'Carregando...' : 'Aplicar'}
-            </button>
+            <div className="d-flex w-100 gap-2">
+              <button
+                className="btn btn-primary btn-sm flex-fill"
+                onClick={fetchStats}
+                disabled={loading}
+              >
+                {loading ? 'Carregando...' : 'Aplicar filtro'}
+              </button>
+
+              <button
+                type="button"
+                className="btn btn-outline-secondary btn-sm flex-fill"
+                onClick={clearFilters}
+                disabled={loading}
+                title="Limpar todos os filtros e voltar ao mês corrente"
+              >
+                Limpar filtro
+              </button>
+            </div>
           </div>
         </div>
       </div>
 
-      {/* Separador entre filtros e conteúdo */}
+      {/* Separador */}
       <hr className="my-3" />
 
       {err && <div className="alert alert-danger">{err}</div>}

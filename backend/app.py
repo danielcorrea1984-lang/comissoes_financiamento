@@ -9,7 +9,8 @@ from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt
 )
 from werkzeug.security import check_password_hash, generate_password_hash
-from sqlalchemy import text, func
+from sqlalchemy import text, func, Computed
+from sqlalchemy.dialects.postgresql import JSONB
 from dotenv import load_dotenv
 
 # Para tokens de redefinição de senha
@@ -27,11 +28,10 @@ app.config['SQLALCHEMY_DATABASE_URI'] = (
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'dev-secret')
 
-# >>> FORÇA o schema 'public' no Postgres (útil no Render)
+# Força o schema 'public' (útil no Render)
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "connect_args": {"options": "-csearch_path=public"}
 }
-# <<< FIM BLOCO >>>
 # ====================================
 
 db = SQLAlchemy(app)
@@ -41,8 +41,6 @@ JWTManager(app)
 # ===================== MODELOS =====================
 class Vendedor(db.Model):
     __tablename__ = 'vendedores'
-    # Se sua tabela estiver em outro schema, descomente:
-    # __table_args__ = {"schema": "public"}
     id = db.Column(db.Integer, primary_key=True)
     nome = db.Column(db.String(255), nullable=False)
     email = db.Column(db.String(255), unique=True, nullable=False)
@@ -77,12 +75,23 @@ class Venda(db.Model):
     banco_id = db.Column(db.Integer, nullable=True)
     loja_parceira_id = db.Column(db.Integer, nullable=True)
 
+    # NOVOS (percentual escolhido e valor da comissão)
+    perc_comissao_aplicado = db.Column(db.Float, nullable=True)  # em %
+
+    # Coluna computada no PG moderno; no fallback vira coluna simples e cuidamos manualmente
+    valor_comissao = db.Column(
+        db.Numeric(12, 2),
+        Computed("ROUND(COALESCE(valor,0) * COALESCE(perc_comissao_aplicado,0) / 100.0, 2)", persisted=True),
+        nullable=True
+    )
+
 class Banco(db.Model):
     __tablename__ = 'bancos'
     id = db.Column(db.Integer, primary_key=True)
     nome = db.Column(db.String(150), nullable=False)
     codigo = db.Column(db.String(20))
     ativo = db.Column(db.Boolean, nullable=False, default=True)
+    comissoes = db.Column(JSONB, nullable=True)  # JSONB no Postgres
 
 class LojaParceira(db.Model):
     __tablename__ = 'lojas_parceiras'
@@ -91,6 +100,87 @@ class LojaParceira(db.Model):
     cnpj = db.Column(db.String(20))
     cidade = db.Column(db.String(120))
     ativo = db.Column(db.Boolean, nullable=False, default=True)
+    # novos
+    repasse = db.Column(db.Numeric(10, 2))
+    data_inicio = db.Column(db.Date, nullable=True)
+    data_fim = db.Column(db.Date, nullable=True)
+
+# ========= DDL de inicialização (idempotente) =========
+def _ensure_columns():
+    with db.engine.begin() as conn:
+        conn.execute(text("""
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='bancos' AND column_name='comissoes'
+              ) THEN
+                ALTER TABLE public.bancos ADD COLUMN comissoes JSONB;
+              END IF;
+            END$$;
+        """))
+
+        conn.execute(text("""
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='vendas' AND column_name='perc_comissao_aplicado'
+              ) THEN
+                ALTER TABLE public.vendas
+                  ADD COLUMN perc_comissao_aplicado NUMERIC(5,2);
+              END IF;
+            END$$;
+        """))
+
+        conn.execute(text("""
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='vendas' AND column_name='valor_comissao'
+              ) THEN
+                BEGIN
+                  EXECUTE '
+                    ALTER TABLE public.vendas
+                      ADD COLUMN valor_comissao NUMERIC(12,2)
+                      GENERATED ALWAYS AS (
+                        ROUND(COALESCE(valor,0) * COALESCE(perc_comissao_aplicado,0) / 100.0, 2)
+                      ) STORED
+                  ';
+                EXCEPTION
+                  WHEN others THEN
+                    EXECUTE 'ALTER TABLE public.vendas ADD COLUMN valor_comissao NUMERIC(12,2)';
+                END;
+              END IF;
+            END$$;
+        """))
+
+        conn.execute(text("""
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='lojas_parceiras' AND column_name='repasse'
+              ) THEN
+                ALTER TABLE public.lojas_parceiras ADD COLUMN repasse NUMERIC(10,2);
+              END IF;
+
+              IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='lojas_parceiras' AND column_name='data_inicio'
+              ) THEN
+                ALTER TABLE public.lojas_parceiras ADD COLUMN data_inicio DATE;
+              END IF;
+
+              IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='lojas_parceiras' AND column_name='data_fim'
+              ) THEN
+                ALTER TABLE public.lojas_parceiras ADD COLUMN data_fim DATE;
+              END IF;
+            END$$;
+        """))
 
 # ============== UTIL CPF/CNPJ ==============
 def apenas_digitos(s: str) -> str:
@@ -126,7 +216,48 @@ def valida_documento(doc: str) -> bool:
     if len(d) == 14: return valida_cnpj(d)
     return False
 
-# ============ COMISSÃO POR FAIXAS ============
+# ======= Normalização de comissões (backend) =======
+def _parse_pct(token):
+    try:
+        s = str(token).strip().replace(' ', '').replace(',', '.')
+        if not s:
+            return None
+        n = float(s)
+        if n < 0 or n > 100:
+            return None
+        return round(n, 4)
+    except Exception:
+        return None
+
+def normalize_commissions(data):
+    source = None
+    if isinstance(data, dict):
+        source = data.get('comissoes') or data.get('faixas') or data.get('commission_values')
+    elif isinstance(data, (list, str)):
+        source = data
+    else:
+        source = None
+
+    vals = []
+    if isinstance(source, list):
+        vals = [_parse_pct(v) for v in source]
+    elif isinstance(source, str):
+        try:
+            import json
+            parsed = json.loads(source)
+            if isinstance(parsed, list):
+                vals = [_parse_pct(v) for v in parsed]
+            else:
+                raise ValueError()
+        except Exception:
+            import re
+            tokens = [t for t in re.split(r'[;\n,]+', source) if t.strip()]
+            vals = [_parse_pct(t) for t in tokens]
+    vals = [v for v in vals if v is not None]
+    vals = sorted(set(vals))
+    return vals
+
+# ============ COMISSÃO POR FAIXAS (legacy) ============
 def calcular_comissao(vendedor_id: int, valor_venda: float) -> float:
     regras = (RegraComissao.query
               .filter((RegraComissao.vendedor_id == vendedor_id) | (RegraComissao.vendedor_id.is_(None)))
@@ -139,6 +270,17 @@ def calcular_comissao(vendedor_id: int, valor_venda: float) -> float:
         elif r.valor_max is not None and r.valor_min <= valor_venda <= r.valor_max:
             faixa = r
     return round(valor_venda * (faixa.percentual/100.0), 2) if faixa else 0.0
+
+def _calc_commission_value(valor: float, perc) -> float:
+    if perc is None:
+        return 0.0
+    try:
+        p = float(perc)
+        if p < 0 or p > 100:
+            return 0.0
+        return round(float(valor) * p / 100.0, 2)
+    except Exception:
+        return 0.0
 
 # ================ HELPERS AUTH/ROLE =================
 def dentro_vigencia(u: Vendedor) -> bool:
@@ -170,6 +312,47 @@ def parse_month(s: str):
         return y, m
     except Exception:
         return None
+
+def parse_percent_to_float_or_none(v):
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == '':
+        return None
+    s = s.replace('.', '').replace(',', '.')
+    try:
+        n = float(s)
+        if n < 0 or n > 100:
+            return None
+        return round(n, 4)
+    except Exception:
+        return None
+
+# ======= HELPERS NOVOS (repasse loja e parse int) =======
+def _to_int_or_none(v):
+    try:
+        if v is None or v == '' or str(v).strip().lower() == 'null':
+            return None
+        return int(str(v))
+    except Exception:
+        return None
+
+def _store_repasse_percent(loja: "LojaParceira", on_date: date) -> float:
+    """
+    Retorna o % de repasse aplicável (0..100) considerando:
+      - loja ativa
+      - vigência (data_inicio/data_fim)
+    """
+    if not loja or not loja.ativo:
+        return 0.0
+    if loja.data_inicio and on_date < loja.data_inicio:
+        return 0.0
+    if loja.data_fim and on_date > loja.data_fim:
+        return 0.0
+    try:
+        return float(loja.repasse or 0.0)
+    except Exception:
+        return 0.0
 
 # ======== TOKEN DE RESET ========
 def _pwd_reset_serializer():
@@ -205,40 +388,28 @@ def login():
         }
     })
 
-# ======== NOVOS ENDPOINTS ========
+# ======== NOVOS ENDPOINTS AUXILIARES ========
 @app.post('/auth/check-email')
 def check_email():
-    """
-    Recebe: { "email": "..." }
-    Retorna: { "exists": true|false }
-    """
     data = request.get_json(silent=True) or {}
     email = (data.get('email') or '').strip().lower()
     if not email:
         return jsonify({'exists': False, 'msg': 'E-mail obrigatório'}), 200
-
     user = Vendedor.query.filter(func.lower(Vendedor.email) == email).first()
     return jsonify({'exists': bool(user)}), 200
 
 @app.post('/auth/reset-password')
 def reset_password_direct():
-    """
-    Recebe: { "email": "...", "password": "..." }
-    Troca a senha diretamente pelo e-mail (sem token).
-    """
     data = request.get_json(silent=True) or {}
     email = (data.get('email') or '').strip().lower()
     nova = (data.get('password') or data.get('nova_senha') or '').strip()
-
     if not email or not nova:
         return jsonify({'msg': 'Email e nova senha são obrigatórios'}), 400
     if len(nova) < 6:
         return jsonify({'msg': 'A nova senha deve ter pelo menos 6 caracteres'}), 400
-
     user = Vendedor.query.filter(func.lower(Vendedor.email) == email).first()
     if not user:
         return jsonify({'msg': 'E-mail não encontrado'}), 404
-
     user.senha_hash = generate_password_hash(nova, method='pbkdf2:sha256', salt_length=16)
     db.session.commit()
     return jsonify({'msg': 'Senha redefinida com sucesso'}), 200
@@ -250,21 +421,16 @@ def forgot_password():
     email = (data.get('email') or '').strip().lower()
     if not email:
         return jsonify({'msg': 'Informe um e-mail'}), 400
-
     user = Vendedor.query.filter(func.lower(Vendedor.email) == email).first()
     if not user:
         return jsonify({'msg': 'E-mail não encontrado'}), 404
-
     s = _pwd_reset_serializer()
     reset_token = s.dumps({'uid': user.id, 'email': user.email})
-
     base = os.getenv('FRONTEND_BASE_URL', 'http://localhost:3000')
     reset_url = f'{base}/reset?token={reset_token}'
-
     app.logger.info('*** RESET DE SENHA ***')
     app.logger.info('Usuário: %s (%s)', user.nome, user.email)
     app.logger.info('URL: %s', reset_url)
-
     return jsonify({'msg': 'OK', 'token': reset_token, 'url': reset_url}), 200
 
 @app.post('/auth/reset')
@@ -272,12 +438,10 @@ def reset_password():
     data = request.get_json(silent=True) or {}
     token = (data.get('token') or '').strip()
     nova = (data.get('nova_senha') or '').strip()
-
     if not token or not nova:
         return jsonify({'msg': 'Token e nova senha são obrigatórios'}), 400
     if len(nova) < 6:
         return jsonify({'msg': 'A nova senha deve ter pelo menos 6 caracteres'}), 400
-
     s = _pwd_reset_serializer()
     try:
         payload = s.loads(token, max_age=3600)  # 1 hora
@@ -286,11 +450,9 @@ def reset_password():
         return jsonify({'msg': 'Token expirado. Solicite novamente.'}), 400
     except (BadSignature, Exception):
         return jsonify({'msg': 'Token inválido'}), 400
-
-    user = Vendedor.query.get(uid)
+    user = db.session.get(Vendedor, uid)
     if not user:
         return jsonify({'msg': 'Usuário não encontrado'}), 404
-
     user.senha_hash = generate_password_hash(nova, method='pbkdf2:sha256', salt_length=16)
     db.session.commit()
     return jsonify({'msg': 'Senha redefinida com sucesso'}), 200
@@ -300,7 +462,16 @@ def reset_password():
 @jwt_required()
 def list_banks():
     rows = Banco.query.order_by(Banco.nome.asc()).all()
-    return jsonify([{'id': r.id, 'nome': r.nome, 'codigo': r.codigo, 'ativo': r.ativo} for r in rows])
+    out = []
+    for r in rows:
+        out.append({
+            'id': r.id,
+            'nome': r.nome,
+            'codigo': r.codigo,
+            'ativo': r.ativo,
+            'comissoes': (r.comissoes or [])
+        })
+    return jsonify(out)
 
 @app.post('/banks')
 @jwt_required()
@@ -310,7 +481,14 @@ def create_bank():
     nome = (data.get('nome') or '').strip()
     if not nome:
         return jsonify({'msg': 'Nome é obrigatório'}), 400
-    b = Banco(nome=nome, codigo=(data.get('codigo') or '').strip() or None, ativo=bool(data.get('ativo', True)))
+
+    coms = normalize_commissions(data)
+    b = Banco(
+        nome=nome,
+        codigo=(data.get('codigo') or '').strip() or None,
+        ativo=bool(data.get('ativo', True)),
+        comissoes=coms or []
+    )
     db.session.add(b)
     db.session.commit()
     return jsonify({'id': b.id}), 201
@@ -321,14 +499,23 @@ def create_bank():
 def update_bank(bank_id):
     b = Banco.query.get_or_404(bank_id)
     data = request.get_json(silent=True) or {}
+
     if 'nome' in data:
         nome = (data.get('nome') or '').strip()
-        if not nome: return jsonify({'msg': 'Nome inválido'}), 400
+        if not nome:
+            return jsonify({'msg': 'Nome inválido'}), 400
         b.nome = nome
+
     if 'codigo' in data:
         b.codigo = (data.get('codigo') or '').strip() or None
+
     if 'ativo' in data:
         b.ativo = bool(data.get('ativo'))
+
+    incoming = normalize_commissions(data)
+    if incoming is not None and len(incoming) >= 0:
+        b.comissoes = incoming
+
     db.session.commit()
     return jsonify({'ok': True})
 
@@ -337,7 +524,16 @@ def update_bank(bank_id):
 @jwt_required()
 def list_stores():
     rows = LojaParceira.query.order_by(LojaParceira.nome.asc()).all()
-    return jsonify([{'id': r.id, 'nome': r.nome, 'cnpj': r.cnpj, 'cidade': r.cidade, 'ativo': r.ativo} for r in rows])
+    return jsonify([{
+        'id': r.id,
+        'nome': r.nome,
+        'cnpj': r.cnpj,
+        'cidade': r.cidade,
+        'ativo': r.ativo,
+        'repasse': (float(r.repasse) if r.repasse is not None else None),
+        'data_inicio': (r.data_inicio.isoformat() if r.data_inicio else None),
+        'data_fim': (r.data_fim.isoformat() if r.data_fim else None),
+    } for r in rows])
 
 @app.post('/stores')
 @jwt_required()
@@ -347,11 +543,19 @@ def create_store():
     nome = (data.get('nome') or '').strip()
     if not nome:
         return jsonify({'msg': 'Nome é obrigatório'}), 400
+
+    repasse = parse_percent_to_float_or_none(data.get('repasse'))
+    dt_inicio = parse_date(data.get('data_inicio'))
+    dt_fim = parse_date(data.get('data_fim'))
+
     l = LojaParceira(
         nome=nome,
         cnpj=(data.get('cnpj') or '').strip() or None,
         cidade=(data.get('cidade') or '').strip() or None,
-        ativo=bool(data.get('ativo', True))
+        ativo=bool(data.get('ativo', True)),
+        repasse=repasse,
+        data_inicio=dt_inicio,
+        data_fim=dt_fim
     )
     db.session.add(l)
     db.session.commit()
@@ -363,19 +567,36 @@ def create_store():
 def update_store(store_id):
     l = LojaParceira.query.get_or_404(store_id)
     data = request.get_json(silent=True) or {}
+
     if 'nome' in data:
         nome = (data.get('nome') or '').strip()
         if not nome: return jsonify({'msg': 'Nome inválido'}), 400
         l.nome = nome
+
     if 'cnpj' in data:
         cnpj = (data.get('cnpj') or '').strip()
-        if cnpj and not valida_cnpj(cnpj):
-            return jsonify({'msg': 'CNPJ inválido'}), 400
-        l.cnpj = cnpj or None
+        if cnpj:
+            if not valida_cnpj(cnpj):
+                return jsonify({'msg': 'CNPJ inválido'}), 400
+            l.cnpj = cnpj
+        else:
+            l.cnpj = None
+
     if 'cidade' in data:
         l.cidade = (data.get('cidade') or '').strip() or None
+
     if 'ativo' in data:
         l.ativo = bool(data.get('ativo'))
+
+    if 'repasse' in data:
+        l.repasse = parse_percent_to_float_or_none(data.get('repasse'))
+
+    if 'data_inicio' in data:
+        l.data_inicio = parse_date(data.get('data_inicio'))
+
+    if 'data_fim' in data:
+        l.data_fim = parse_date(data.get('data_fim'))
+
     db.session.commit()
     return jsonify({'ok': True})
 
@@ -476,7 +697,6 @@ def list_sales():
 
     q = db.session.query(Venda)
 
-    # filtros básicos (texto)
     cliente = request.args.get('cliente_nome')
     doc = request.args.get('cliente_documento')
     status = request.args.get('status')
@@ -488,7 +708,6 @@ def list_sales():
     if status:
         q = q.filter(Venda.status == status)
 
-    # filtros por id de referência
     banco_id = request.args.get('banco_id', type=int)
     loja_id = request.args.get('loja_id', type=int)
     vendedor_id = request.args.get('vendedor_id', type=int) if role == 'admin' else None
@@ -504,15 +723,42 @@ def list_sales():
 
     vendas = q.order_by(Venda.data_venda.desc()).limit(1000).all()
 
-    # map vendedor names (para admin)
+    # map vendedores (para admin)
     nomes = {}
     if role == 'admin' and vendas:
         vids = {v.vendedor_id for v in vendas}
         for r in Vendedor.query.filter(Vendedor.id.in_(vids)).all():
             nomes[r.id] = r.nome
 
+    # map lojas para calcular repasse sem N+1
+    store_ids = {v.loja_parceira_id for v in vendas if v.loja_parceira_id}
+    stores_by_id = {}
+    if store_ids:
+        for l in LojaParceira.query.filter(LojaParceira.id.in_(store_ids)).all():
+            stores_by_id[l.id] = l
+
     out = []
     for v in vendas:
+        # comissão "real" (valor * % escolhido na venda, ou legacy por faixa)
+        comissao_real = (
+            _calc_commission_value(v.valor, v.perc_comissao_aplicado)
+            if v.perc_comissao_aplicado is not None
+            else calcular_comissao(v.vendedor_id, v.valor)
+        )
+
+        # repasse para a loja (se houver e estiver vigente)
+        venda_date = (v.data_venda.date() if v.data_venda else date.today())
+        loja = stores_by_id.get(v.loja_parceira_id)
+        rep_pct = _store_repasse_percent(loja, venda_date) if loja else 0.0
+        rep_val = round(comissao_real * rep_pct / 100.0, 2) if rep_pct else 0.0
+
+        # comissão do vendedor (a definir — por enquanto None)
+        comissao_vendedor = None
+
+        empresa_bruta = round(comissao_real - rep_val, 2)
+        empresa_liquida = (round(empresa_bruta - (comissao_vendedor or 0.0), 2)
+                           if comissao_vendedor is not None else None)
+
         out.append({
             'id': v.id,
             'vendedor_id': v.vendedor_id,
@@ -526,7 +772,14 @@ def list_sales():
             'loja_parceira': v.loja_parceira,
             'banco_id': v.banco_id,
             'loja_parceira_id': v.loja_parceira_id,
-            'comissao': calcular_comissao(v.vendedor_id, v.valor)
+            'perc_comissao_aplicado': (float(v.perc_comissao_aplicado) if v.perc_comissao_aplicado is not None else None),
+            'comissao': comissao_real,              # compat
+            'comissao_real': comissao_real,        # claro
+            'loja_repasse_percent': rep_pct,
+            'loja_repasse_valor': rep_val,
+            'comissao_vendedor': comissao_vendedor,
+            'empresa_bruta': empresa_bruta,
+            'empresa_liquida': empresa_liquida
         })
     return jsonify(out)
 
@@ -541,8 +794,17 @@ def create_sale():
         valor = float(data.get('valor'))
         status = (data.get('status') or 'enviada').strip()
         observacoes = (data.get('observacoes') or '').strip() or None
-        banco_id = data.get('banco_id')
-        loja_id = data.get('loja_parceira_id')
+
+        banco_id = _to_int_or_none(data.get('banco_id'))
+        loja_id = _to_int_or_none(data.get('loja_parceira_id'))
+
+        perc_com_aplicado = data.get('perc_comissao_aplicado', None)
+        if perc_com_aplicado is not None and perc_com_aplicado != '':
+            perc_com_aplicado = float(perc_com_aplicado)
+            if perc_com_aplicado < 0 or perc_com_aplicado > 100:
+                return jsonify({'msg': 'Percentual de comissão inválido'}), 400
+        else:
+            perc_com_aplicado = None
     except Exception:
         return jsonify({'msg': 'Dados inválidos'}), 400
 
@@ -557,11 +819,11 @@ def create_sale():
     banco_nome = None
     loja_nome = None
     if banco_id:
-        b = Banco.query.get(banco_id)
+        b = db.session.get(Banco, banco_id)
         if not b: return jsonify({'msg': 'Banco não encontrado'}), 404
         banco_nome = b.nome
     if loja_id:
-        l = LojaParceira.query.get(loja_id)
+        l = db.session.get(LojaParceira, loja_id)
         if not l: return jsonify({'msg': 'Loja parceira não encontrada'}), 404
         loja_nome = l.nome
 
@@ -572,18 +834,60 @@ def create_sale():
         valor=valor,
         status=status,
         observacoes=observacoes,
-        data_venda=datetime.utcnow(),
+        # data_venda -> deixamos para CURRENT_TIMESTAMP do banco
         banco=banco_nome or (data.get('banco') or '').strip() or '—',
         loja_parceira=loja_nome or (data.get('loja_parceira') or '').strip() or None,
         banco_id=banco_id,
-        loja_parceira_id=loja_id
+        loja_parceira_id=loja_id,
+        perc_comissao_aplicado=perc_com_aplicado
     )
     db.session.add(v)
-    db.session.flush()  # pega id
+    db.session.flush()  # pega id do insert
+    sale_id = v.id  # salva antes de qualquer possível expiração
 
-    comissao = calcular_comissao(uid, valor)
+    # comissão real
+    comissao_real = (
+        _calc_commission_value(v.valor, v.perc_comissao_aplicado)
+        if v.perc_comissao_aplicado is not None
+        else calcular_comissao(uid, valor)
+    )
+
+    # Fallback: atualiza valor_comissao APENAS se a coluna não for GENERATED.
+    # Rodamos em SAVEPOINT; se falhar (coluna gerada), fazemos rollback do savepoint e seguimos.
+    sp = db.session.begin_nested()
+    try:
+        db.session.execute(
+            text("UPDATE public.vendas SET valor_comissao = :vc WHERE id = :id"),
+            {"vc": comissao_real, "id": sale_id}
+        )
+        sp.commit()
+    except Exception:
+        sp.rollback()
+
+    # repasse loja
+    venda_date = date.today()
+    loja = db.session.get(LojaParceira, loja_id) if loja_id else None
+    rep_pct = _store_repasse_percent(loja, venda_date) if loja else 0.0
+    rep_val = round(comissao_real * rep_pct / 100.0, 2) if rep_pct else 0.0
+
+    # comissão do vendedor (a definir)
+    comissao_vendedor = None
+
+    empresa_bruta = round(comissao_real - rep_val, 2)
+    empresa_liquida = (round(empresa_bruta - (comissao_vendedor or 0.0), 2)
+                       if comissao_vendedor is not None else None)
+
     db.session.commit()
-    return jsonify({'id': v.id, 'comissao': comissao}), 201
+    return jsonify({
+        'id': sale_id,
+        'comissao': comissao_real,           # compat
+        'comissao_real': comissao_real,
+        'loja_repasse_percent': rep_pct,
+        'loja_repasse_valor': rep_val,
+        'comissao_vendedor': comissao_vendedor,
+        'empresa_bruta': empresa_bruta,
+        'empresa_liquida': empresa_liquida
+    }), 201
 
 @app.put('/sales/<int:sale_id>')
 @jwt_required()
@@ -616,11 +920,10 @@ def update_sale(sale_id):
     if 'observacoes' in data:
         v.observacoes = (data.get('observacoes') or '').strip() or None
 
-    # atualizar refs/nomes
     if 'banco_id' in data:
         bid = data.get('banco_id')
         if bid:
-            b = Banco.query.get(bid)
+            b = db.session.get(Banco, bid)
             if not b: return jsonify({'msg': 'Banco não encontrado'}), 404
             v.banco_id = bid; v.banco = b.nome
         else:
@@ -628,11 +931,42 @@ def update_sale(sale_id):
     if 'loja_parceira_id' in data:
         lid = data.get('loja_parceira_id')
         if lid:
-            l = LojaParceira.query.get(lid)
+            l = db.session.get(LojaParceira, lid)
             if not l: return jsonify({'msg': 'Loja parceira não encontrada'}), 404
             v.loja_parceira_id = lid; v.loja_parceira = l.nome
         else:
             v.loja_parceira_id = None
+
+    if 'perc_comissao_aplicado' in data:
+        raw = data.get('perc_comissao_aplicado')
+        if raw in (None, '', 'null'):
+            v.perc_comissao_aplicado = None
+        else:
+            try:
+                p = float(raw)
+                if p < 0 or p > 100:
+                    return jsonify({'msg': 'Percentual de comissão inválido'}), 400
+                v.perc_comissao_aplicado = p
+            except Exception:
+                return jsonify({'msg': 'Percentual de comissão inválido'}), 400
+
+    db.session.flush()
+
+    comissao = (
+        _calc_commission_value(v.valor, v.perc_comissao_aplicado)
+        if v.perc_comissao_aplicado is not None
+        else calcular_comissao(v.vendedor_id, v.valor)
+    )
+
+    sp = db.session.begin_nested()
+    try:
+        db.session.execute(
+            text("UPDATE public.vendas SET valor_comissao = :vc WHERE id = :id"),
+            {"vc": comissao, "id": v.id}
+        )
+        sp.commit()
+    except Exception:
+        sp.rollback()
 
     db.session.commit()
     return jsonify({'ok': True})
@@ -641,13 +975,6 @@ def update_sale(sale_id):
 @app.get('/stats/summary')
 @jwt_required()
 def stats_summary():
-    """
-    Resumo para Dashboard com filtros:
-      start=YYYY-MM, end=YYYY-MM
-      status=enviada|aceita|recusada
-      banco_id, loja_id
-      vendedor_id (apenas admin)
-    """
     claims = get_jwt()
     role = claims.get('role')
     uid = int(get_jwt_identity())
@@ -743,7 +1070,6 @@ def stats_summary():
 def ping():
     return jsonify(status="ok"), 200
 
-# Debug avançado (TEMPORÁRIO — remova depois que validar)
 @app.get('/_debug/db')
 def _debug_db():
     try:
@@ -769,15 +1095,11 @@ def _debug_db():
     except Exception as e:
         app.logger.exception("debug_db failed")
         return jsonify(error=str(e)), 500
-    
 
-    
-    # ===== Debug NOVO (rotas diferentes para garantir que subiu) =====
 APP_DEBUG_VERSION = "v2"
 
 @app.get("/_debug/version")
 def _debug_version():
-    # Útil para ver se seu deploy trouxe o código novo
     return jsonify(version=APP_DEBUG_VERSION)
 
 @app.get("/_debug/db2")
@@ -805,8 +1127,10 @@ def _debug_db2():
     except Exception as e:
         app.logger.exception("debug_db2 failed")
         return jsonify(error=str(e)), 500
-# ===== Fim Debug NOVO =====
 
+# ===== Inicialização pós-app =====
+with app.app_context():
+    _ensure_columns()
 
 if __name__ == '__main__':
     app.run(debug=True)

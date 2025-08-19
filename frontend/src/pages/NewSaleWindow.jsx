@@ -1,4 +1,3 @@
-// frontend/src/pages/NewSaleWindow.jsx
 import React from 'react';
 import AddSale from '../sections/AddSale';
 
